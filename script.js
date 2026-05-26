@@ -13,15 +13,7 @@ try {
     if (periodInput === undefined) throw 'Missing param period';
 
     function convertToSeconds(periodStr) {
-        var timeUnits = {
-            y: 31536000,
-            M: 2592000,
-            d: 86400,
-            h: 3600,
-            m: 60,
-            s: 1
-        };
-
+        var timeUnits = { y: 31536000, M: 2592000, d: 86400, h: 3600, m: 60, s: 1 };
         var regex = /(\d+)([yMdhms]?)/g;
         var matches;
         var totalSeconds = 0;
@@ -36,8 +28,62 @@ try {
         return totalSeconds;
     }
 
-    var period = convertToSeconds(periodInput);
-    Zabbix.Log(3, logtag + 'Input period: ' + periodInput + ' => seconds: ' + period);
+    // --- EXTENDED LOGIC FOR START TIME WITH DATE ---
+    var durationInput = periodInput;
+    var time_start = Math.floor(Date.now() / 1000); // Default: Now
+
+    if (periodInput.indexOf(',') > -1) {
+        var parts = periodInput.split(',');
+        var dateTimeStr = parts[0].trim(); // e.g., "2026-05-27 15:00:00" or "15:00"
+        durationInput = parts[1].trim();   // e.g., "3h"
+
+        var dtParts = dateTimeStr.split(' ');
+        var dateStr = '';
+        var timeStr = '';
+
+        // Check if a date part is present (space separates date and time)
+        if (dtParts.length === 2) {
+            dateStr = dtParts[0];
+            timeStr = dtParts[1];
+        } else {
+            timeStr = dtParts[0]; // Only time
+        }
+
+        var d = new Date();
+
+        // 1. Parse date (if present)
+        if (dateStr !== '') {
+            var dParts = dateStr.split('-');
+            if (dParts.length === 3) {
+                // Format: YYYY-MM-DD
+                d.setFullYear(parseInt(dParts[0], 10), parseInt(dParts[1], 10) - 1, parseInt(dParts[2], 10));
+            } else if (dParts.length === 2) {
+                // Format: MM-DD (Current year remains)
+                d.setMonth(parseInt(dParts[0], 10) - 1, parseInt(dParts[1], 10));
+            }
+        }
+
+        // 2. Parse time
+        var tParts = timeStr.split(':');
+        if (tParts.length >= 2) {
+            var hours = parseInt(tParts[0], 10);
+            var minutes = parseInt(tParts[1], 10);
+            var seconds = tParts.length === 3 ? parseInt(tParts[2], 10) : 0;
+            
+            d.setHours(hours, minutes, seconds, 0);
+            time_start = Math.floor(d.getTime() / 1000);
+            
+            // 3. Auto-shift: ONLY if NO date was specified and the time is in the past
+            var current_time = Math.floor(Date.now() / 1000);
+            if (dateStr === '' && time_start < current_time) {
+                time_start += 86400; 
+                Zabbix.Log(3, logtag + 'Start time is in the past. Moving start to tomorrow.');
+            }
+        }
+    }
+
+    var period = convertToSeconds(durationInput);
+    Zabbix.Log(3, logtag + 'Input period: ' + periodInput + ' => duration: ' + durationInput + ' => seconds: ' + period + ' => start_ts: ' + time_start);
 
     // If period > 0 but < 600, set to 600
     if (period > 0 && period < 600) {
@@ -91,8 +137,6 @@ try {
         output: "extend"
     });
 
-    Zabbix.Log(3, logtag + 'Found maintenances for host: ' + hostname + ': ' + JSON.stringify(maintenances));
-
     var scriptMaintenanceName = "Script Maintenance Host: " + hostname;
     var existingMaintenance = null;
     if (maintenances && maintenances.length > 0) {
@@ -104,62 +148,56 @@ try {
         }
     }
 
-    var time_now = Math.floor(Date.now() / 1000);
     var MAX_ACTIVE_TILL = 2147468400;
-    var time_end = (period > 0) ? (period > (MAX_ACTIVE_TILL - time_now) ? MAX_ACTIVE_TILL : time_now + period) : null;
+    var time_end = (period > 0) ? (period > (MAX_ACTIVE_TILL - time_start) ? MAX_ACTIVE_TILL : time_start + period) : null;
 
     if (period === 0) {
-        // Delete maintenance if value is 0 and a script maintenance exists 
         if (existingMaintenance) {
             Zabbix.Log(3, logtag + 'Period=0, deleting existing script maintenance: ' + existingMaintenance.maintenanceid);
             var delResult = zbxApiCall('maintenance.delete', [existingMaintenance.maintenanceid]);
-            Zabbix.Log(4, logtag + 'Deleted maintenance: ' + JSON.stringify(delResult));
             return "Maintenance deleted.";
         } else {
-            Zabbix.Log(3, logtag + 'Period=0, but no script maintenance found. Doing nothing.');
             return "No script-created maintenance found. Nothing to do.";
         }
     }
 
     // period > 0 -> create or update maintenance for given host
-    var date = new Date(time_end * 1000);
-    var dateString = date.toLocaleString();
-    var description = "Managed by Zabbix Script. Until: " + dateString;
+    var dateStartObj = new Date(time_start * 1000);
+    var dateEndObj = new Date(time_end * 1000);
+    var description = "Managed by Zabbix Script. From: " + dateStartObj.toLocaleString() + " Until: " + dateEndObj.toLocaleString();
 
     if (existingMaintenance) {
         // Update existing Maintenance
-        Zabbix.Log(3, logtag + 'Updating existing script maintenance: ' + existingMaintenance.maintenanceid + ' with new period: ' + period);
         var updateParams = {
             maintenanceid: existingMaintenance.maintenanceid,
-            active_since: time_now,
+            active_since: time_start,
             active_till: time_end,
             timeperiods: [{
                 "timeperiod_type": 0,
-                "period": period
+                "period": period,
+                "start_date": time_start
             }],
             description: description
         };
         var updateResult = zbxApiCall('maintenance.update', updateParams);
-        Zabbix.Log(4, logtag + 'Updated maintenance: ' + JSON.stringify(updateResult));
-        return "Maintenance updated until " + dateString;
+        return "Maintenance updated to run from " + dateStartObj.toLocaleString() + " until " + dateEndObj.toLocaleString();
     } else {
         // Create new maintenance
-        Zabbix.Log(3, logtag + 'Creating new script maintenance with period: ' + period);
         var createParams = {
             name: scriptMaintenanceName,
-            active_since: time_now,
+            active_since: time_start,
             active_till: time_end,
             description: description,
             maintenance_type: 0,
             timeperiods: [{
                 "timeperiod_type": 0,
-                "period": period
+                "period": period,
+                "start_date": time_start
             }],
             hosts: [{hostid: hostid}]
         };
         var createResult = zbxApiCall('maintenance.create', createParams);
-        Zabbix.Log(4, logtag + 'Created maintenance: ' + JSON.stringify(createResult));
-        return "Maintenance created until " + dateString;
+        return "Maintenance created to run from " + dateStartObj.toLocaleString() + " until " + dateEndObj.toLocaleString();
     }
 
 } catch (error) {
